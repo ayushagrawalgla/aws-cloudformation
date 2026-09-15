@@ -1,0 +1,331 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  Two-server website deployed across two Availability Zones
+  behind an Application Load Balancer.
+
+Parameters:
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type for the web servers.
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64'
+    Description: Latest Amazon Linux 2023 x86_64 AMI.
+
+Resources:
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: ALB-Website-VPC
+
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: ALB-Website-IGW
+
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: ALB-Website-PublicSubnet-A
+
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: ALB-Website-PublicSubnet-B
+
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: ALB-Website-PublicRoutes
+
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetA
+
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetB
+
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP traffic to the Application Load Balancer.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ALB-Website-LB-SG
+
+
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP traffic from the Application Load Balancer.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ALB-Website-WebServer-SG
+
+
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: ALB-Website-LaunchTemplate
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        SecurityGroupIds:
+          - !Ref WebServerSecurityGroup
+
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+
+            dnf update -y
+            dnf install -y httpd
+
+            systemctl enable httpd
+            systemctl start httpd
+
+            AZ=$(TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" \
+              -H "X-aws-ec2-metadata-token-ttl-seconds: 21600"); \
+              curl -s \
+              -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/placement/availability-zone)
+
+            if [[ "$AZ" == *"a" ]]; then
+              BACKGROUND="#90EE90"
+              SERVER="Server 1 - AZ-A"
+            else
+              BACKGROUND="#FFD580"
+              SERVER="Server 2 - AZ-B"
+            fi
+
+            cat > /var/www/html/index.html <<EOF
+            <!DOCTYPE html>
+            <html>
+            <head>
+              <title>ALB Website</title>
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+              <style>
+                body {
+                  margin: 0;
+                  min-height: 100vh;
+                  display: flex;
+                  align-items: center;
+                  justify-content: center;
+                  background: $BACKGROUND;
+                  font-family: Arial, sans-serif;
+                }
+
+                .card {
+                  background: white;
+                  padding: 50px;
+                  border-radius: 20px;
+                  text-align: center;
+                  box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+                }
+
+                h1 {
+                  margin-bottom: 10px;
+                }
+
+                p {
+                  font-size: 20px;
+                }
+              </style>
+            </head>
+
+            <body>
+              <div class="card">
+                <h1>🚀 AWS Application Load Balancer</h1>
+                <p><strong>$SERVER</strong></p>
+                <p>Availability Zone: $AZ</p>
+                <p>Traffic successfully reached this EC2 instance.</p>
+              </div>
+            </body>
+            </html>
+            EOF
+
+
+  WebServerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: '2'
+      MaxSize: '2'
+      DesiredCapacity: '2'
+
+      VPCZoneIdentifier:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+        Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+
+      TargetGroupARNs:
+        - !Ref WebTargetGroup
+
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 120
+
+      Tags:
+        - Key: Name
+          Value: ALB-Website-Server
+          PropagateAtLaunch: true
+
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: ALB-Website-ALB
+      Scheme: internet-facing
+      Type: application
+
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+
+      Tags:
+        - Key: Name
+          Value: ALB-Website-ALB
+
+
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '80'
+      HealthCheckPath: /
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      HealthCheckTimeoutSeconds: 5
+      HealthCheckIntervalSeconds: 15
+
+      Matcher:
+        HttpCode: '200'
+
+      Tags:
+        - Key: Name
+          Value: ALB-Website-TargetGroup
+
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+
+
+Outputs:
+
+  ALBDnsName:
+    Description: DNS name of the Application Load Balancer.
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+
+  ALBWebsiteURL:
+    Description: HTTP URL of the website.
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+
+  VPCId:
+    Description: ID of the created VPC.
+    Value: !Ref VPC
+
+  WebServerSecurityGroupId:
+    Description: Security group ID of the web servers.
+    Value: !Ref WebServerSecurityGroup
+
+  TargetGroupArn:
+    Description: ARN of the Application Load Balancer target group.
+    Value: !Ref WebTargetGroup
